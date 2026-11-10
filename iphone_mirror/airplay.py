@@ -18,6 +18,13 @@ log = logging.getLogger(__name__)
 SERVER = f"AirTunes/{discovery.SRCVERS}"
 NTP_EPOCH = 2208988800
 
+APPROVAL_WAIT_S = 45  # how long a SETUP waits for the user to answer the "allow this iPhone?" box
+DENY_COOLDOWN_S = 120  # after a refusal, the same address is refused silently (no popup spam)
+
+
+class Denied(Exception):
+    """The user (or the approval rules) refused this sender."""
+
 
 def _bplist(obj) -> bytes:
     return plistlib.dumps(obj, fmt=plistlib.FMT_BINARY, sort_keys=False)
@@ -188,6 +195,9 @@ class Connection:
                 pass
             else:
                 log.warning("unhandled request %s %s", req.method, req.url)
+        except Denied:
+            resp = Response(403, "Forbidden")
+            resp.close = True
         except Exception as e:
             log.exception("error handling %s %s", req.method, req.url)
             resp = Response(500, "Internal Server Error")
@@ -278,6 +288,10 @@ class Connection:
         if "ekey" in plist and "eiv" in plist:
             self.client_name = plist.get("name") or "iPhone"
             log.info("SETUP from %s (%s, %s)", self.client_name, plist.get("model"), plist.get("osVersion"))
+            device_id = str(plist.get("deviceID") or plist.get("macAddress") or "").upper()
+            if not await rx.authorize(self.remote_ip, device_id, self.client_name, plist.get("model") or ""):
+                log.warning("mirroring from %s (%s, %s) refused", self.client_name, device_id or "?", self.remote_ip)
+                raise Denied()
             rx.emit("connecting", name=self.client_name, ip=self.remote_ip, model=plist.get("model") or "",
                     os=plist.get("osVersion") or "")
             loop = asyncio.get_running_loop()
@@ -387,6 +401,55 @@ class Receiver:
         self._mirror_owner = None
         self._thread = None
         self._server = None
+        # approval of unknown senders: on_approve(info, reply) is called on the asyncio
+        # thread and must hand off to the GUI; reply(allowed: bool) may be called from any thread
+        self.on_approve = None
+        self._pending = {}  # remote ip -> Future of the open approval question
+        self._denied = {}  # remote ip -> monotonic time until which it is refused silently
+
+    # ---------------------------------------------------------------- approval
+    def is_trusted(self, device_id: str) -> bool:
+        return bool(device_id) and device_id in (self.settings.get("trusted_devices") or {})
+
+    async def authorize(self, ip: str, device_id: str, name: str, model: str) -> bool:
+        """Ask the user before an unknown iPhone may mirror. Trusted devices pass at once."""
+        if not self.settings.get("require_approval", True) or self.on_approve is None:
+            return True
+        if self.is_trusted(device_id):
+            return True
+        if self._denied.get(ip, 0) > time.monotonic():
+            return False
+        fut = self._pending.get(ip)
+        if fut is None:
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            self._pending[ip] = fut
+
+            def done(f, ip=ip):
+                self._pending.pop(ip, None)
+                if not f.result():
+                    self._denied[ip] = time.monotonic() + DENY_COOLDOWN_S
+
+            fut.add_done_callback(done)
+
+            def reply(allowed, fut=fut):
+                def apply():
+                    if not fut.done():
+                        fut.set_result(bool(allowed))
+
+                loop.call_soon_threadsafe(apply)
+
+            try:
+                self.on_approve(dict(ip=ip, device_id=device_id, name=name, model=model), reply)
+            except Exception:
+                log.exception("approval request failed")
+                fut.set_result(False)
+        try:
+            # shield: if the iPhone gives up waiting, the question stays open; a later
+            # "always allow" still stores the trust, so the next attempt goes straight through
+            return await asyncio.wait_for(asyncio.shield(fut), APPROVAL_WAIT_S)
+        except asyncio.TimeoutError:
+            return False
 
     def emit(self, event, **info):
         try:

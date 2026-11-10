@@ -68,6 +68,10 @@ class Bridge(QObject):
     frame = Signal(object, int, int)
     event = Signal(str, dict)
     control = Signal(str, str)  # Controller.on_state(state, message)
+    approve = Signal(dict, object)  # Receiver.on_approve(info, reply)
+
+
+APPROVAL_BOX_S = 60  # an unanswered "allow this iPhone?" box closes itself (= refuse)
 
 
 def app_icon(size: int = 64) -> QIcon:
@@ -331,6 +335,70 @@ class PhoneWindow(QWidget):
         self._update_anim()
         self.update()
 
+    def on_approve(self, info, reply):
+        """An unknown iPhone wants to mirror: ask the user. Runs on the GUI thread (Bridge.approve)."""
+        name = info.get("name") or "iPhone"
+        model = info.get("model") or "?"
+        device_id = info.get("device_id") or ""
+        text = (
+            f"Thiết bị “{name}” ({model}, địa chỉ {info.get('ip') or '?'}) muốn phát màn hình lên máy này.\n\n"
+            "Nếu đây không phải iPhone của bạn, hãy bấm Từ chối."
+        )
+        box = QMessageBox(QMessageBox.Question, "Cho phép phát màn hình?", text, QMessageBox.NoButton, self)
+        always = box.addButton("Luôn cho phép", QMessageBox.AcceptRole) if device_id else None
+        once = box.addButton("Chỉ lần này", QMessageBox.AcceptRole)
+        deny = box.addButton("Từ chối", QMessageBox.RejectRole)
+        box.setDefaultButton(deny)
+        box.setEscapeButton(deny)
+        box.setWindowModality(Qt.NonModal)
+        box.setWindowFlag(Qt.WindowStaysOnTopHint)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        answered = [False]
+
+        def answer(button):
+            if answered[0]:
+                return
+            answered[0] = True
+            if always is not None and button is always:
+                trusted = dict(self.settings.get("trusted_devices") or {})
+                trusted[device_id] = name
+                self.settings["trusted_devices"] = trusted
+                self.settings.save()
+                log.info("trusted %s (%s)", name, device_id)
+                reply(True)
+            elif button is once:
+                reply(True)
+            else:
+                reply(False)
+
+        box.buttonClicked.connect(answer)
+        box.finished.connect(lambda _=None: answer(None))  # closed with the X or Esc = refuse
+
+        def expire():
+            if not answered[0]:
+                answer(None)
+                try:
+                    box.close()
+                except RuntimeError:  # already deleted
+                    pass
+
+        QTimer.singleShot(APPROVAL_BOX_S * 1000, expire)
+        self._show_front()
+        box.show()
+        box.raise_()
+        box.activateWindow()
+
+    def _forget_trusted(self):
+        self.settings["trusted_devices"] = {}
+        self.settings.save()
+        self._hint("Đã xóa danh sách iPhone tin cậy")
+
+    def _toggle_approval(self):
+        on = not self.settings.get("require_approval", True)
+        self.settings["require_approval"] = on
+        self.settings.save()
+        self._hint("Hỏi trước khi phát: bật" if on else "Hỏi trước khi phát: TẮT")
+
     def _show_control_error(self, message):
         if self._error_box is not None:
             try:
@@ -579,7 +647,8 @@ class PhoneWindow(QWidget):
 
         font = QFont("Segoe UI Semibold", 9)
         p.setFont(font)
-        text_rect = QRectF(b.x() + 14, b.y(), max(0.0, btn["control"].left() - b.x() - 18), b.height())
+        first = min(r.left() for r in btn.values())  # the leftmost button (subclasses may drop some)
+        text_rect = QRectF(b.x() + 14, b.y(), max(0.0, first - b.x() - 18), b.height())
         fm = QFontMetrics(font)
         labels = self._bar_labels()
         label = next((t for t in labels if fm.horizontalAdvance(t) <= text_rect.width()), None)
@@ -595,7 +664,8 @@ class PhoneWindow(QWidget):
             p.setBrush(QColor(255, 255, 255, 34))
             p.drawEllipse(btn[self._hover_btn].center(), s * 0.42, s * 0.42)
 
-        self._paint_hand(p, btn["control"].center() + QPointF(0.8 * k, 0.4 * k), k * 0.95, self._control_color())
+        if "control" in btn:
+            self._paint_hand(p, btn["control"].center() + QPointF(0.8 * k, 0.4 * k), k * 0.95, self._control_color())
 
         white = QColor(255, 255, 255, 220)
         d = 4.5 * k
@@ -987,6 +1057,15 @@ class PhoneWindow(QWidget):
         m.addSeparator()
         m.addAction("Save Screenshot", self.screenshot)
         m.addAction("Rename PC...", self._rename)
+        ask = QAction(
+            "Hỏi trước khi cho iPhone lạ phát", m, checkable=True,
+            checked=bool(self.settings.get("require_approval", True)),
+        )
+        ask.triggered.connect(self._toggle_approval)
+        m.addAction(ask)
+        n = len(self.settings.get("trusted_devices") or {})
+        forget = m.addAction(f"Quên các iPhone tin cậy ({n})", self._forget_trusted)
+        forget.setEnabled(n > 0)
         m.addAction("Open Log", self._open_log)
         m.addSeparator()
         m.addAction("Quit", QApplication.quit)

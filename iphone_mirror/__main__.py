@@ -90,6 +90,9 @@ def main():
         on_event=lambda e, info: bridge.event.emit(e, info),
     )
     win.rx = rx
+    # unknown iPhones must be allowed in a dialog first (setting "require_approval")
+    rx.on_approve = lambda info, reply: bridge.approve.emit(info, reply)
+    bridge.approve.connect(win.on_approve)
     if args.local:
         rx.muted = True  # self-test: decode audio but keep the speakers silent
     bridge.frame.connect(win.on_frame)

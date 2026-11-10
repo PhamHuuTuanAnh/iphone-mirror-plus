@@ -25,10 +25,10 @@ CODECS = {
 class Player:
     """Small jitter buffer in front of a sounddevice output stream."""
 
-    PREBUFFER = int(RATE * 0.08)
-    MAX_BUFFER = int(RATE * 0.35)
-
-    def __init__(self):
+    def __init__(self, rate=RATE):
+        self.rate = rate
+        self.PREBUFFER = int(rate * 0.08)
+        self.MAX_BUFFER = int(rate * 0.35)
         self._chunks = collections.deque()
         self._buffered = 0
         self._lock = threading.Lock()
@@ -40,7 +40,7 @@ class Player:
             import sounddevice as sd
 
             self._stream = sd.OutputStream(
-                samplerate=RATE, channels=2, dtype="int16", latency="low", callback=self._callback
+                samplerate=rate, channels=2, dtype="int16", latency="low", callback=self._callback
             )
             self._stream.start()
         except Exception as e:

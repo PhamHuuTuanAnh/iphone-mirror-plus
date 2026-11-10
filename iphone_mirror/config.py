@@ -21,6 +21,9 @@ DEFAULTS = {
     "fps": 60,
     "audio": True,
     "always_on_top": True,
+    # ask in a dialog before an iPhone that is not in trusted_devices may mirror
+    "require_approval": True,
+    "trusted_devices": {},  # deviceID -> name, filled by "Luôn cho phép"
     # window geometry (logical pixels); 0 = automatic
     "x": None,
     "y": None,
@@ -38,7 +41,8 @@ class Settings:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         if path.exists():
             try:
-                self.data.update(json.loads(path.read_text(encoding="utf-8")))
+                # utf-8-sig: also accept a file saved with a BOM (e.g. edited in PowerShell)
+                self.data.update(json.loads(path.read_text(encoding="utf-8-sig")))
             except Exception as e:  # corrupt file: keep defaults, rewrite
                 log.warning("settings.json unreadable (%s), using defaults", e)
         changed = False
