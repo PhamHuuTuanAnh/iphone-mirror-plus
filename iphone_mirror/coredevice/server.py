@@ -189,6 +189,22 @@ def _patch_wifi_tunnel():
     userspace_tunnel._create_no_root_tunnel_provider = provider
 
 
+def _patch_tunnel_socket():
+    """Low-latency TCP options on the socket that carries the Wi-Fi tunnel (see perf.py)."""
+    from pymobiledevice3.remote import tunnel_service
+
+    from .perf import tune_tunnel_socket
+
+    original = tunnel_service.create_connection
+
+    def create_connection(*args, **kwargs):
+        sock = original(*args, **kwargs)
+        tune_tunnel_socket(sock)
+        return sock
+
+    tunnel_service.create_connection = create_connection
+
+
 def apply_patches():
     if sys.platform == "darwin":
         return
@@ -198,6 +214,7 @@ def apply_patches():
     screen_stream.ScreenStreamServer._missing_audio_deps = staticmethod(lambda: [])
     _patch_bonjour_browse()
     _patch_wifi_tunnel()
+    _patch_tunnel_socket()
     from . import extras
 
     extras.install()
@@ -205,6 +222,9 @@ def apply_patches():
 
 def child_main(argv):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    from .perf import boost_process
+
+    boost_process()
     apply_patches()
     from pymobiledevice3.__main__ import main as pmd3_main
 
@@ -260,8 +280,12 @@ def _free_port():
 class ServerProcess:
     """Starts the serve-web child on a free loopback port with a random password."""
 
-    def __init__(self, ltrp=False, audio=True, udid=None):
+    def __init__(self, ltrp=False, audio=True, udid=None, motion_idr=False):
         self.ltrp = ltrp
+        # Forced keyframes while the screen moves bring a collapsed (blurry) picture back to
+        # full resolution faster, but measured on Wi-Fi they halve the frame rate (~23 vs
+        # ~50 fps): off by default, the window stretches a collapsed picture instead.
+        self.motion_idr = motion_idr
         self.audio = audio
         self.udid = udid  # the iPhone to look for over Wi-Fi (learned over USB)
         self.port = 0
@@ -291,6 +315,7 @@ class ServerProcess:
             ]
             if self.ltrp:
                 args.append("--ltrp")
+            args.append("--motion-idr" if self.motion_idr else "--no-motion-idr")
             if not self.audio:
                 args.append("--no-audio")
             APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -302,7 +327,8 @@ class ServerProcess:
             env["IPHONE_MIRROR_PASSWORD"] = self.password
             # run from the package's parent folder so "-m iphone_mirror..." resolves
             cwd = str(Path(__file__).resolve().parents[2])
-            log.info("starting CoreDevice server on port %d (ltrp=%s)", self.port, self.ltrp)
+            log.info("starting CoreDevice server on port %d (ltrp=%s, motion_idr=%s)",
+                     self.port, self.ltrp, self.motion_idr)
             self.proc = subprocess.Popen(
                 args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
                 creationflags=NO_WINDOW,

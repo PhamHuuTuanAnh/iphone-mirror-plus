@@ -35,6 +35,7 @@ GRAY_Y = 128  # luma of the gray margin of a collapsed frame
 MEASURE_EVERY_S = 1.0
 DARK_LUMA = 4  # mean luma of a frame from a switched-off screen is 0
 STILL_TIMEOUT_S = 20  # no video this long: check the connection (a still screen sends nothing)
+STATS_EVERY_S = 30.0  # how often the video timing line goes to the log
 NOT_FOUND = (
     "Không thấy iPhone. Cắm cáp, hoặc để iPhone mở khóa và cùng mạng Wi-Fi với máy tính "
     "(cần bật kết nối Wi-Fi một lần khi cắm cáp)."
@@ -207,7 +208,8 @@ class CoreDeviceReceiver:
         self.screen_off = False
         self.emit("starting_server" if first else "searching", message="")
         self.server = ServerProcess(
-            ltrp=bool(self.settings.get("ltrp", True)), audio=True, udid=self.settings.get("udid") or None
+            ltrp=bool(self.settings.get("ltrp", True)), audio=True, udid=self.settings.get("udid") or None,
+            motion_idr=bool(self.settings.get("motion_idr", False)),
         )
         try:
             self.server.start()
@@ -268,6 +270,24 @@ class CoreDeviceReceiver:
             if self._stop.wait(0.5 * errors):
                 return
 
+    def _stats_add(self, name, seconds):
+        """Per-stage timing, logged every STATS_EVERY_S: frames decoded/shown and their cost."""
+        st = getattr(self, "_stats", None)
+        now = time.monotonic()
+        if st is None:
+            st = self._stats = {"t": now}
+        n, total, worst = st.get(name, (0, 0.0, 0.0))
+        st[name] = (n + 1, total + seconds, max(worst, seconds))
+        span = now - st["t"]
+        if span >= STATS_EVERY_S:
+            parts = []
+            for key in ("decode", "deliver"):
+                n, total, worst = st.get(key, (0, 0.0, 0.0))
+                if n:
+                    parts.append(f"{key} {n / span:.1f}/s avg {total / n * 1000:.1f} ms max {worst * 1000:.1f} ms")
+            log.info("video: %s", "; ".join(parts))
+            self._stats = {"t": now}
+
     def _new_codec(self):
         with self.server.request("/codec", timeout=10) as r:
             info = json.loads(r.read())
@@ -293,6 +313,7 @@ class CoreDeviceReceiver:
         resp = self.server.request("/stream.bin", timeout=STILL_TIMEOUT_S)
         buf = bytearray()
         got_key = False
+        newest = None  # decoded frame not shown yet
         try:
             while not self._stop.is_set():
                 try:
@@ -317,13 +338,24 @@ class CoreDeviceReceiver:
                     if not got_key:
                         continue
                     try:
+                        t0 = time.perf_counter()
                         frames = ctx.decode(av.Packet(data))
+                        self._stats_add("decode", time.perf_counter() - t0)
                     except av.error.FFmpegError as e:
                         log.debug("decode error: %s", e)
                         got_key = False  # wait for the next keyframe
+                        newest = None
                         continue
                     if frames:
-                        self._deliver(frames[-1])
+                        newest = frames[-1]
+                # Frames often arrive in bursts (two in one read). Every one is decoded (the
+                # next ones reference it) but only the newest is scaled and shown: showing the
+                # older one too would only delay the current picture.
+                if newest is not None:
+                    t0 = time.perf_counter()
+                    self._deliver(newest)
+                    self._stats_add("deliver", time.perf_counter() - t0)
+                    newest = None
         finally:
             resp.close()
 

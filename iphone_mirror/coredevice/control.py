@@ -12,6 +12,7 @@ import collections
 import http.client
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -43,7 +44,30 @@ VK_TO_HID.update({
 })
 for _i in range(12):
     VK_TO_HID[0x70 + _i] = 0x3A + _i  # F1..F12
-HID_LEFT_GUI, HID_V = 0xE3, 0x19
+HID_LEFT_GUI, HID_V, HID_LEFT_SHIFT, HID_BACKSPACE = 0xE3, 0x19, 0xE1, 0x2A
+MODIFIER_USAGES = frozenset(range(0xE0, 0xE8))  # Ctrl Shift Alt Command, left and right
+
+# Printable ASCII -> (HID usage, needs Shift) on a US layout: text an input method sends
+# as Unicode packets (EVKey re-sends "ng" after "ế") is typed as keys when it is plain ASCII.
+ASCII_TO_HID = {" ": (0x2C, False), "\n": (0x28, False), "\r": (0x28, False), "\t": (0x2B, False)}
+for _i in range(26):
+    ASCII_TO_HID[chr(0x61 + _i)] = (0x04 + _i, False)
+    ASCII_TO_HID[chr(0x41 + _i)] = (0x04 + _i, True)
+for _i, (_plain, _shifted) in enumerate(zip("1234567890", "!@#$%^&*()")):
+    ASCII_TO_HID[_plain] = (0x1E + _i, False)
+    ASCII_TO_HID[_shifted] = (0x1E + _i, True)
+for _usage, _plain, _shifted in (
+    (0x2D, "-", "_"), (0x2E, "=", "+"), (0x2F, "[", "{"), (0x30, "]", "}"), (0x31, "\\", "|"),
+    (0x33, ";", ":"), (0x34, "'", '"'), (0x35, "`", "~"), (0x36, ",", "<"), (0x37, ".", ">"), (0x38, "/", "?"),
+):
+    ASCII_TO_HID[_plain] = (_usage, False)
+    ASCII_TO_HID[_shifted] = (_usage, True)
+
+TRACE_INPUT = bool(os.environ.get("IPHONE_MIRROR_TRACE_INPUT"))  # log every key/paste sent
+PASTE_SETTLE_S = 0.05  # after the pasteboard is set, before Command+V
+PASTE_APPLY_S = 0.25  # after Command+V, before the next key (0.1 s still mixed up the order)
+RESTORE_CLIPBOARD_S = 1.5  # typing pause after which the iPhone pasteboard is put back
+_UNSET = object()
 
 
 class _Sender(threading.Thread):
@@ -82,6 +106,8 @@ class _Sender(threading.Thread):
         if server is None:
             return
         body = json.dumps(payload).encode()
+        if TRACE_INPUT:
+            log.info("send %s %s", path, body.decode("utf-8", "replace"))
         try:
             if self._conn is None:
                 self._conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
@@ -123,6 +149,8 @@ class LiveControl:
         self._lock = threading.Lock()
         self._keys = []  # HID usages currently held, in press order
         self.clipboard_sync = None  # ClipboardSync, set by the app
+        self._clip_saved = _UNSET  # iPhone pasteboard text from before input-method typing
+        self._restore_timer = None
 
     # ---------------------------------------------------------------- state
     @property
@@ -222,7 +250,20 @@ class LiveControl:
         self._touch.put("/touch", run)
 
     # ---------------------------------------------------------------- keyboard
+    def _drop_held_letters(self):
+        """Treat held non-modifier keys as released on the iPhone, without pressing them again.
+
+        Fast typing overlaps keys: "y" is still down when the input method eats "f" and sends
+        Backspaces + "ày". Sending Backspace as [y, Backspace], or restoring [y] after a paste,
+        makes iOS type another "y". The PC still releases "y" later; key_up then has nothing
+        left to do."""
+        if any(u not in MODIFIER_USAGES for u in self._keys):
+            self._keys = [u for u in self._keys if u in MODIFIER_USAGES]
+            self._other.put("/key", {"usages": list(self._keys)})
+
     def key_down(self, usage):
+        if usage == HID_BACKSPACE:
+            self._drop_held_letters()
         if usage not in self._keys:
             self._keys.append(usage)
             self._other.put("/key", {"usages": list(self._keys)})
@@ -237,16 +278,94 @@ class LiveControl:
             self._keys = []
             self._other.put("/key", {"usages": []})
 
-    def paste_text(self, text):
+    def type_unicode(self, text):
+        """Text from an input method (EVKey, Unikey, the emoji panel...): plain ASCII is typed
+        as keys, anything else is pasted in one go and the iPhone pasteboard is put back
+        afterwards (see paste_text)."""
+        if not text:
+            return
+        self._drop_held_letters()
+        if all(c in ASCII_TO_HID for c in text):
+            self._type_ascii(text)
+        else:
+            self.paste_text(text, restore=True)
+
+    def _type_ascii(self, text):
+        """US-layout key presses for each character, whatever modifiers are held right now;
+        the held keys are pressed again at the end."""
+        for ch in text:
+            usage, shift = ASCII_TO_HID[ch]
+            if shift:
+                self._other.put("/key", {"usages": [HID_LEFT_SHIFT]})
+                self._other.put("/key", {"usages": [HID_LEFT_SHIFT, usage]})
+            else:
+                self._other.put("/key", {"usages": [usage]})
+            self._other.put("/key", {"usages": []})
+        if self._keys:
+            self._other.put("/key", {"usages": list(self._keys)})
+
+    def paste_text(self, text, restore=False):
         """Type any text (Vietnamese, emoji...) by putting it on the iPhone pasteboard and
-        pressing Command+V: a hardware keyboard can only send keys of the iPhone's layout."""
+        pressing Command+V: a hardware keyboard can only send keys of the iPhone's layout.
+
+        restore=True (typing through an input method): what was on the iPhone pasteboard
+        before is read once and put back RESTORE_CLIPBOARD_S after the last such paste, so
+        typing Vietnamese does not leave "ế" where the user's copied text was."""
+        self._drop_held_letters()
+        if restore:
+            self._other.put("/clipboard", self._save_clipboard_once)
         if self.clipboard_sync is not None:
             self.clipboard_sync.ignore_next_device_text(text)
         self._other.put("/clipboard", {"text": text})
-        self._other.put("/key", lambda: time.sleep(0.05))
+        self._other.put("/key", lambda: time.sleep(PASTE_SETTLE_S))
         self._other.put("/key", {"usages": [HID_LEFT_GUI]})
         self._other.put("/key", {"usages": [HID_LEFT_GUI, HID_V]})
         self._other.put("/key", {"usages": []})
+        # iOS pastes asynchronously: keys sent sooner can land before the pasted text
+        self._other.put("/key", lambda: time.sleep(PASTE_APPLY_S))
+        if self._keys:
+            self._other.put("/key", {"usages": list(self._keys)})
+        if restore:
+            self._schedule_restore()
+
+    def tap(self, usage, times=1):
+        """Press and release a key (Backspace for the word composer) without modifiers;
+        held modifiers are pressed again afterwards."""
+        self._drop_held_letters()
+        for _ in range(times):
+            self._other.put("/key", {"usages": [usage]})
+            self._other.put("/key", {"usages": []})
+        if self._keys:
+            self._other.put("/key", {"usages": list(self._keys)})
+
+    # Runs on the "control" sender thread, in order with the pastes.
+    def _save_clipboard_once(self):
+        if self._clip_saved is not _UNSET or self.server is None:
+            return
+        saved = None
+        try:
+            with self.server.request("/clipboard", timeout=5) as r:
+                saved = json.loads(r.read()).get("text")
+        except Exception as e:
+            log.debug("read pasteboard before typing: %s", e)
+        self._clip_saved = saved  # None: nothing to put back (empty, image, or unreadable)
+
+    def _schedule_restore(self):
+        with self._lock:
+            if self._restore_timer is not None:
+                self._restore_timer.cancel()
+            t = threading.Timer(RESTORE_CLIPBOARD_S, lambda: self._other.put("/clipboard", self._restore_clipboard))
+            t.daemon = True
+            self._restore_timer = t
+            t.start()
+
+    def _restore_clipboard(self):
+        saved, self._clip_saved = self._clip_saved, _UNSET
+        if saved is None or saved is _UNSET or self.server is None:
+            return
+        if self.clipboard_sync is not None:
+            self.clipboard_sync.ignore_next_device_text(saved)
+        self._other._post("/clipboard", {"text": saved})
 
     # ---------------------------------------------------------------- buttons (Controller API)
     def press(self, name):

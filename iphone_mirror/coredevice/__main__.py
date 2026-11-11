@@ -67,6 +67,9 @@ def main():
     p.add_argument("--quit-after", type=float, default=0, help="self-test: exit after N seconds")
     args = p.parse_args()
     setup_logging()
+    from .perf import boost_process
+
+    boost_process()
     set_app_identity()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("iPhone Mirror Plus")

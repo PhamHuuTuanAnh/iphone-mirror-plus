@@ -420,12 +420,25 @@ class PhoneWindow(QWidget):
         rect = self.phone_rect()
         r = self.corner_radius()
 
-        # soft shadow
+        # soft shadow: its 11 antialiased layers cost more than the rest of the frame, so
+        # they are drawn once per window size and reused
+        dpr = self.devicePixelRatioF()
+        key = (self.width(), self.height(), rect.x(), rect.y(), rect.width(), rect.height(), round(r, 3), dpr)
+        if getattr(self, "_shadow_key", None) != key:
+            img = QImage(round(self.width() * dpr), round(self.height() * dpr), QImage.Format_ARGB32_Premultiplied)
+            img.setDevicePixelRatio(dpr)
+            img.fill(0)
+            sp = QPainter(img)
+            sp.setRenderHint(QPainter.Antialiasing)
+            sp.setPen(Qt.NoPen)
+            for i in range(SHADOW, 0, -2):
+                a = int(34 * (1 - i / SHADOW) ** 2) + 2
+                sp.setBrush(QColor(0, 0, 0, a))
+                sp.drawRoundedRect(rect.adjusted(-i, -i + 6, i, i + 6), r + i, r + i)
+            sp.end()
+            self._shadow_key, self._shadow_img = key, img
+        p.drawImage(0, 0, self._shadow_img)
         p.setPen(Qt.NoPen)
-        for i in range(SHADOW, 0, -2):
-            a = int(34 * (1 - i / SHADOW) ** 2) + 2
-            p.setBrush(QColor(0, 0, 0, a))
-            p.drawRoundedRect(rect.adjusted(-i, -i + 6, i, i + 6), r + i, r + i)
 
         if self.image is not None and self.state in ("mirroring", "paused", "connecting"):
             brush = QBrush(self.image)
