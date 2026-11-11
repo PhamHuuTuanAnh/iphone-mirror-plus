@@ -1,7 +1,9 @@
 """AirPlay real-time audio (RTP over UDP): AES-CBC decryption, AAC-ELD/ALAC decode, playback."""
 import asyncio
 import collections
+import ctypes
 import logging
+import sys
 import threading
 
 import av
@@ -22,8 +24,44 @@ CODECS = {
 }
 
 
+def _default_output_name():
+    """Name of the Windows default playback device as waveOut sees it (None if unknown/not Windows).
+
+    Same query PortAudio's MME backend uses to pick its default device; costs microseconds."""
+    if sys.platform != "win32":
+        return None
+    winmm = ctypes.windll.winmm
+    dev_id, status = wintypes.DWORD(0), wintypes.DWORD(0)
+    rc = winmm.waveOutMessage(
+        wintypes.HANDLE(-1), 0x2015,  # WAVE_MAPPER, DRVM_MAPPER_PREFERRED_GET
+        ctypes.cast(ctypes.byref(dev_id), ctypes.c_void_p), ctypes.cast(ctypes.byref(status), ctypes.c_void_p),
+    )
+    if rc != 0:
+        return None
+    caps = _WAVEOUTCAPSW()
+    if winmm.waveOutGetDevCapsW(ctypes.c_size_t(dev_id.value), ctypes.byref(caps), ctypes.sizeof(caps)) != 0:
+        return None
+    return caps.szPname
+
+
+if sys.platform == "win32":
+    from ctypes import wintypes
+
+    class _WAVEOUTCAPSW(ctypes.Structure):
+        _fields_ = [
+            ("wMid", wintypes.WORD), ("wPid", wintypes.WORD), ("vDriverVersion", wintypes.UINT),
+            ("szPname", wintypes.WCHAR * 32), ("dwFormats", wintypes.DWORD), ("wChannels", wintypes.WORD),
+            ("wReserved1", wintypes.WORD), ("dwSupport", wintypes.DWORD),
+        ]
+
+    ctypes.windll.winmm.waveOutMessage.argtypes = [wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p, ctypes.c_void_p]
+    ctypes.windll.winmm.waveOutMessage.restype = wintypes.UINT
+    ctypes.windll.winmm.waveOutGetDevCapsW.argtypes = [ctypes.c_size_t, ctypes.c_void_p, wintypes.UINT]
+    ctypes.windll.winmm.waveOutGetDevCapsW.restype = wintypes.UINT
+
+
 class Player:
-    """Small jitter buffer in front of a sounddevice output stream."""
+    """Small jitter buffer in front of a sounddevice output stream that follows the Windows default device."""
 
     def __init__(self, rate=RATE):
         self.rate = rate
@@ -36,17 +74,37 @@ class Player:
         self.gain = 1.0
         self.muted = False
         self._stream = None
-        try:
-            import sounddevice as sd
+        self._device = None  # name of the Windows default output the stream was opened on
+        self._stream_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._open(reinit=False)
+        # PortAudio picks its default device once (at init) and never follows Windows: a Bluetooth
+        # headset connected later, or a different default chosen in Windows, kept getting nothing.
+        threading.Thread(target=self._follow_default, name="audio-device", daemon=True).start()
 
-            self._stream = sd.OutputStream(
-                samplerate=rate, channels=2, dtype="int16", latency="low", callback=self._callback
-            )
-            self._stream.start()
-        except Exception as e:
-            log.error("audio output unavailable: %s", e)
+    def _open(self, reinit):
+        """(Re)open the output stream on the current Windows default device."""
+        with self._stream_lock:
+            if self._closed.is_set():
+                return
+            self._close_stream()
+            try:
+                import sounddevice as sd
 
-    def close(self):
+                if reinit:  # re-enumerate devices so PortAudio sees the new default
+                    sd._terminate()
+                    sd._initialize()
+                self._device = _default_output_name()
+                self._stream = sd.OutputStream(
+                    samplerate=self.rate, channels=2, dtype="int16", latency="low", callback=self._callback
+                )
+                self._stream.start()
+                log.info("audio output: %s", self._device or sd.query_devices(kind="output")["name"])
+            except Exception as e:
+                self._stream = None
+                log.error("audio output unavailable: %s", e)
+
+    def _close_stream(self):
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -54,6 +112,26 @@ class Player:
             except Exception:
                 pass
             self._stream = None
+
+    def _follow_default(self):
+        while not self._closed.wait(1.0):
+            try:
+                name = _default_output_name()
+            except Exception:
+                continue
+            if name is None:
+                continue
+            stream = self._stream
+            dead = stream is not None and not stream.active  # died under us (device removed)
+            if name != self._device or dead:
+                log.info("audio output changed: %s -> %s%s", self._device, name, " (stream stopped)" if dead else "")
+                self.flush()
+                self._open(reinit=True)
+
+    def close(self):
+        self._closed.set()
+        with self._stream_lock:
+            self._close_stream()
 
     def flush(self):
         with self._lock:

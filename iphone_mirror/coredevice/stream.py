@@ -30,6 +30,7 @@ from .server import ServerProcess
 log = logging.getLogger(__name__)
 
 AUDIO_RATE = 48000
+AUDIO_DEAD_S = 20  # no PCM this long (screen on) = iOS dropped the audio session
 PAD_DARK_Y = 24  # luma of the black padding (full-range video: 0..~20)
 GRAY_Y = 128  # luma of the gray margin of a collapsed frame
 MEASURE_EVERY_S = 1.0
@@ -505,6 +506,7 @@ class CoreDeviceReceiver:
     def _audio_loop(self, session):
         if not self.settings.get("audio", True):
             return
+        self._audio_last = None  # monotonic time of the last PCM chunk in this session
         while not (self._stop.is_set() or session.is_set()):
             try:
                 self._audio_once(session)
@@ -512,8 +514,26 @@ class CoreDeviceReceiver:
                 if self._stop.is_set() or session.is_set():
                     break
                 log.info("audio stream: %s", e)
+                if self._audio_dead():
+                    # The iPhone sends PCM nonstop, silence included (measured: 100 packets/s of
+                    # zeros), so no packet at all means iOS dropped the audio session (seen after
+                    # an interruption). pymobiledevice3 never notices, and restarting audio alone
+                    # inside the same server is unreliable (iOS then sends nothing), so start a
+                    # fresh session: video comes back with it.
+                    log.warning("audio: nothing from the iPhone for %.0f s - restarting the session",
+                                time.monotonic() - self._audio_last)
+                    server = self.server
+                    if server is not None:
+                        server.stop()
+                    break
             if session.wait(1.5):
                 break
+
+    def _audio_dead(self):
+        """Audio flowed earlier in this session and has been missing for AUDIO_DEAD_S while the
+        screen is on (a dark/locked phone may legitimately pause it; checked again once it wakes)."""
+        last = self._audio_last
+        return last is not None and not self.screen_off and time.monotonic() - last >= AUDIO_DEAD_S
 
     def _audio_once(self, session):
         server = self.server
@@ -537,6 +557,7 @@ class CoreDeviceReceiver:
                     pcm = bytes(buf[4:4 + n])
                     del buf[:4 + n]
                     if len(pcm) >= 4:
+                        self._audio_last = time.monotonic()
                         if not getattr(self, "_audio_logged", False):
                             self._audio_logged = True
                             log.info("audio: first PCM chunk, %d bytes", len(pcm))
