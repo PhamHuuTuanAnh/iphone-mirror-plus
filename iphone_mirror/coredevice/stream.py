@@ -308,23 +308,73 @@ class CoreDeviceReceiver:
         except Exception:
             return False
 
+    def _open_stream(self):
+        """GET /stream.bin on a plain socket. Unlike an urllib response, a socket can go on
+        reading after a timeout, so a still screen (no video at all) keeps the same
+        subscription: every new subscriber makes the server ask for a keyframe, a still
+        screen ignores that, and the server then restarts the whole stream, which also
+        dropped touches."""
+        s = socket.create_connection(("127.0.0.1", self.server.port), timeout=10)
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.sendall(
+                f"GET /stream.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {self.server.auth_header}\r\n\r\n"
+                .encode()
+            )
+            head = bytearray()
+            while b"\r\n\r\n" not in head:
+                part = s.recv(4096)
+                if not part:
+                    raise ConnectionError("stream refused")
+                head += part
+            end = head.index(b"\r\n\r\n")
+            status = head[:head.index(b"\r\n")].decode("latin-1", "replace")
+            if " 200 " not in status + " ":
+                raise ConnectionError(f"stream: {status}")
+            s.settimeout(STILL_TIMEOUT_S)
+            return s, bytearray(head[end + 4:])
+        except BaseException:
+            s.close()
+            raise
+
+    @staticmethod
+    def _dechunk(raw, out):
+        """Move complete HTTP chunks from raw into out. Returns False at the last chunk."""
+        while True:
+            j = raw.find(b"\r\n")
+            if j < 0:
+                return True
+            size = int(raw[:j].split(b";")[0] or b"0", 16)
+            if size == 0:
+                return False
+            if len(raw) < j + 2 + size + 2:
+                return True
+            out += raw[j + 2:j + 2 + size]
+            del raw[:j + 2 + size + 2]
+
     def _stream_once(self):
         ctx = self._new_codec()
-        resp = self.server.request("/stream.bin", timeout=STILL_TIMEOUT_S)
+        sock, raw = self._open_stream()
         buf = bytearray()
         got_key = False
         newest = None  # decoded frame not shown yet
+        leftover = bool(raw)  # bytes that came with the response headers
         try:
             while not self._stop.is_set():
-                try:
-                    chunk = resp.read1(1 << 16)
-                except (TimeoutError, socket.timeout):
-                    if self._healthy():
-                        return  # just a still screen: reconnect the stream, not an error
-                    raise ConnectionError("no video and the server lost the iPhone")
-                if not chunk:
+                if leftover:
+                    leftover, chunk = False, b""
+                else:
+                    try:
+                        chunk = sock.recv(1 << 16)
+                    except (TimeoutError, socket.timeout):
+                        if self._healthy():
+                            continue  # just a still screen: keep waiting on the same stream
+                        raise ConnectionError("no video and the server lost the iPhone")
+                    if not chunk:
+                        raise ConnectionError("stream ended")
+                raw += chunk
+                if not self._dechunk(raw, buf):
                     raise ConnectionError("stream ended")
-                buf += chunk
                 while len(buf) >= 4:
                     n = int.from_bytes(buf[:4], "big")
                     if len(buf) < 4 + n:
@@ -357,7 +407,7 @@ class CoreDeviceReceiver:
                     self._stats_add("deliver", time.perf_counter() - t0)
                     newest = None
         finally:
-            resp.close()
+            sock.close()
 
     def _measure(self, frame):
         """Picture size without the black padding (grow-only per coded size, re-measured

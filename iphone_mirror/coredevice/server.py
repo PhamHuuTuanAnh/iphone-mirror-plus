@@ -205,6 +205,90 @@ def _patch_tunnel_socket():
     tunnel_service.create_connection = create_connection
 
 
+STALL_NO_VIDEO_S = 5.0  # no video at least this long ...
+STALL_UNANSWERED_S = 4.0  # ... and the last input got no picture change this long: restart
+
+
+def _patch_stall_watchdog():
+    """Restart the stream only when the user's input got no answer, never on a still screen.
+
+    A still screen sends no video at all. pymobiledevice3's watchdog restarted the stream
+    after 5 s without video, and a restart also closes the HID services and empties the
+    input queue: a swipe made around then was lost or cut (measured: a restart every
+    ~15 s while the screen stood still). Asking for a keyframe does not help: a still
+    encoder ignores the request. So the stream counts as stalled only if a touch, key or
+    button came after the last picture and nothing changed STALL_UNANSWERED_S later
+    (and never while a finger is down)."""
+    import asyncio
+    import json as _json
+
+    from pymobiledevice3.remote.core_device import screen_stream as ss
+
+    log_ = logging.getLogger("iphone_mirror.stall")
+    cls = ss.ScreenStreamServer
+
+    def note_input(self, touching=None):
+        self._im_last_input_t = asyncio.get_running_loop().time()
+        if touching is not None:
+            self._im_touch_down = touching
+
+    orig_touch, orig_key, orig_button = cls._handle_touch, cls._handle_key, cls._handle_button
+
+    async def handle_touch(self, body):
+        try:
+            op = _json.loads(body).get("type")
+        except Exception:
+            op = None
+        note_input(self, touching=(op == "contact"))
+        return await orig_touch(self, body)
+
+    async def handle_key(self, body):
+        note_input(self)
+        return await orig_key(self, body)
+
+    async def handle_button(self, body):
+        note_input(self)
+        return await orig_button(self, body)
+
+    async def stall_watchdog(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                return
+            if not self._subscribers or self._active_service is None:
+                continue
+            now = loop.time()
+            last_video = self._last_good_au_t
+            last_input = getattr(self, "_im_last_input_t", 0.0)
+            if (
+                now - last_video < STALL_NO_VIDEO_S
+                or last_input <= last_video
+                or now - last_input < STALL_UNANSWERED_S
+                or getattr(self, "_im_touch_down", False)
+                or now - self._last_restart_t < ss._STALL_RESTART_COOLDOWN_SECS
+            ):
+                continue
+            log_.warning("input %.1fs ago got no picture change (no video for %.1fs) - restarting stream",
+                         now - last_input, now - last_video)
+            self._last_restart_t = now
+            self._im_last_input_t = 0.0  # one restart per unanswered input
+            try:
+                await asyncio.wait_for(self._ensure_fresh_stream(force=True), timeout=10.0)
+            except asyncio.TimeoutError:
+                log_.warning("stream restart did not complete within 10s")
+            except Exception as exc:
+                if ss._is_tunnel_dead_error(exc):
+                    log_.warning("device appears disconnected (%s); handing off to reconnect loop", exc)
+                    self._reconnect_signal.set()
+                else:
+                    log_.exception("stream restart failed")
+
+    cls._handle_touch, cls._handle_key, cls._handle_button = handle_touch, handle_key, handle_button
+    cls._stall_watchdog = stall_watchdog
+
+
 def apply_patches():
     if sys.platform == "darwin":
         return
@@ -215,6 +299,7 @@ def apply_patches():
     _patch_bonjour_browse()
     _patch_wifi_tunnel()
     _patch_tunnel_socket()
+    _patch_stall_watchdog()
     from . import extras
 
     extras.install()
